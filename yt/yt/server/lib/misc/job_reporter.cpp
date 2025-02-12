@@ -83,6 +83,7 @@ public:
             Report_.FinishTime(),
             /*updateTime*/ TInstant::Now().MicroSeconds(),
             Report_.Address(),
+            Report_.Addresses(),
             Report_.StderrSize(),
             Report_.HasCompetitors(),
             Report_.HasProbingCompetitors(),
@@ -187,9 +188,15 @@ public:
         if (archiveVersion >= 53 && Report_.Ttl()) {
             record.Ttl = Report_.Ttl()->MilliSeconds();
         }
+
         // COMPAT(eshcherbin)
         if (archiveVersion >= 55 && Report_.OperationIncarnation()) {
             record.OperationIncarnation = Report_.OperationIncarnation();
+        }
+
+        // COMPAT(aleksandr.gaev)
+        if (archiveVersion >= 56 && Report_.Addresses()) {
+            record.Addresses = ConvertToYsonString(*Report_.Addresses());
         }
 
         return FromRecord(record);

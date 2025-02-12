@@ -1120,6 +1120,28 @@ class TestListJobs(TestListJobsBase):
         check_filter(1, to_time=middle_time_after_breakpoint)
         check_filter(2, to_time=end_time)
 
+    @authors("aleksandr.gaev")
+    def test_job_addresses(self):
+        op = run_test_vanilla(
+            with_breakpoint("BREAKPOINT"),
+        )
+        (job_id,) = wait_breakpoint()
+
+        def check_addresses(list_jobs_response):
+            return len(list_jobs_response) == 1 and "address" in list_jobs_response[0] and "addresses" in list_jobs_response[0]
+
+        wait(lambda: check_addresses(list_jobs(op.id, verbose=False)["jobs"]))
+
+        release_breakpoint()
+
+        op.track()
+
+        jobs = list_jobs(op.id, verbose=False)["jobs"]
+        assert check_addresses(jobs)
+        assert len(jobs[0].get("address")) > 0
+        assert len(jobs[0].get("addresses")) > 0
+
+
 ##################################################################
 
 
