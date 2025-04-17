@@ -494,7 +494,8 @@ void ValidateCheckPermissionsResults(
             NSecurityClient::EErrorCode::AuthorizationError,
             "Operation access denied")
             << TErrorAttribute("user", userStr)
-            << TErrorAttribute("required_permissions", permissionSet);
+            << TErrorAttribute("required_permissions", permissionSet)
+            << TErrorAttribute("access_control_rule", accessControlRule.GetAclString()); // TODO REMOVE
         if (operationId) {
             error = error
                 << TErrorAttribute("operation_id", operationId);

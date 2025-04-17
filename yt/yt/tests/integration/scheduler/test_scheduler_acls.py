@@ -4,6 +4,7 @@ from yt_commands import (
     exists, create_user,
     create_group, make_ace, add_member, read_table, write_table, map, map_reduce, run_test_vanilla, abort_job, abandon_job,
     get_operation, get_job_fail_context, get_job_input, get_job_stderr, get_job_spec, dump_job_context,
+    get_job, list_operations, list_jobs, print_debug,
     poll_job_shell, abort_op,
     complete_op, suspend_op,
     resume_op, clean_operations, sync_create_cells, create_test_tables,
@@ -22,13 +23,14 @@ import yt_error_codes
 
 import yt.environment.init_operations_archive as init_operations_archive
 
-from yt.common import YtError
+from yt.common import YtError, YT_DATETIME_FORMAT_STRING
 
 import pytest
 
 import random
 import string
 import time
+from datetime import datetime
 from contextlib import contextmanager
 from copy import deepcopy
 
@@ -54,9 +56,8 @@ def _update_op_parameters(**kwargs):
     update_op_parameters(kwargs.pop("operation_id"), **kwargs)
 
 
-class TestSchedulerAcls(YTEnvSetup):
+class TestSchedulerAclsBase(YTEnvSetup):
     ENABLE_MULTIDAEMON = False  # There are component restarts.
-    NUM_TEST_PARTITIONS = 3
     USE_DYNAMIC_TABLES = True
 
     NUM_MASTERS = 1
@@ -116,7 +117,7 @@ class TestSchedulerAcls(YTEnvSetup):
     }
 
     def setup_method(self, method):
-        super(TestSchedulerAcls, self).setup_method(method)
+        super(TestSchedulerAclsBase, self).setup_method(method)
 
         # Init operations archive.
         sync_create_cells(1)
@@ -164,8 +165,9 @@ class TestSchedulerAcls(YTEnvSetup):
     def _validate_access(user, should_have_access, action, **action_args):
         has_access = True
         authorization_error = None
+        result = None
         try:
-            action(authenticated_user=user, **action_args)
+            result = action(authenticated_user=user, **action_args)
         except YtError as e:
             if not e.contains_code(yt_error_codes.AuthorizationErrorCode):
                 raise
@@ -183,6 +185,7 @@ class TestSchedulerAcls(YTEnvSetup):
             )
             if not has_access:
                 message += ". Got error response {}".format(authorization_error)
+            message += ". Action result: {}".format(result)
             raise AssertionError(message)
 
     def _run_and_fail_op(self, should_update_operation_parameters):
@@ -246,6 +249,10 @@ class TestSchedulerAcls(YTEnvSetup):
             except YtError:
                 # TODO: Ensure it is "no such operation" error or operation has failed or aborted.
                 pass
+
+
+class TestSchedulerAcls(TestSchedulerAclsBase):
+    NUM_TEST_PARTITIONS = 3
 
     @authors("omgronny")
     @pytest.mark.parametrize("should_update_operation_parameters", [False, True])
@@ -703,3 +710,300 @@ class TestSchedulerAcls(YTEnvSetup):
         )
         time.sleep(0.1)
         assert not op.get_alerts()
+
+
+class TestSchedulerAclsStrictMode(TestSchedulerAclsBase):
+    NUM_TEST_PARTITIONS = 6
+
+    DELTA_DRIVER_CONFIG = {
+        "strict_scheduler_commands_access_validation": True,
+    }
+
+    DELTA_PROXY_CONFIG = {
+        "cluster_connection": {
+            "strict_scheduler_commands_access_validation": True,
+        },
+    }
+
+    @authors("aleksandr.gaev")
+    @pytest.mark.parametrize("use_acl", [False, True])
+    @pytest.mark.parametrize("should_archive_operation", [False, True])
+    def test_get_operation(self, use_acl, should_archive_operation):
+        spec = self.spec if use_acl else {"aco_name": "users"}
+        op = run_test_vanilla(
+            command=with_breakpoint("BREAKPOINT"),
+            spec=spec,
+        )
+        wait_breakpoint()
+
+        if should_archive_operation:
+            release_breakpoint()
+            clean_operations()
+
+        if not use_acl:
+            pytest.skip("get_operation doesn't do correct validation with aco_name yet.")
+
+        self._validate_access(self.no_rights_user, False, get_operation, op_id_or_alias=op.id)
+        self._validate_access(self.read_only_user, True, get_operation, op_id_or_alias=op.id)
+        self._validate_access(self.manage_only_user, False, get_operation, op_id_or_alias=op.id)
+        self._validate_access(self.manage_and_read_user, True, get_operation, op_id_or_alias=op.id)
+        self._validate_access(self.banned_from_managing_user, True, get_operation, op_id_or_alias=op.id)
+        self._validate_access(self.banned_user, False, get_operation, op_id_or_alias=op.id)
+
+    @authors("aleksandr.gaev")
+    @pytest.mark.parametrize("should_update_operation_parameters", [False, True])
+    @pytest.mark.parametrize("should_clean_operations", [False, True])
+    def test_get_job(self, should_update_operation_parameters, should_clean_operations):
+        op, job_id = self._run_and_fail_op(should_update_operation_parameters)
+        if should_clean_operations:
+            clean_operations()
+
+        @wait_no_assert
+        def wait():
+            job = get_job(op.id, job_id)
+            assert job
+
+        self._validate_access(self.no_rights_user, False, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.read_only_user, True, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.manage_only_user, False, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.manage_and_read_user, True, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.banned_from_managing_user, True, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.banned_user, False, get_job, operation_id=op.id, job_id=job_id)
+
+    @authors("aleksandr.gaev")
+    def test_get_job_with_aco(self):
+        op = run_test_vanilla(
+            command=with_breakpoint("BREAKPOINT"),
+            spec={
+                "aco_name": "users",
+            }
+        )
+
+        (job_id,) = wait_breakpoint()
+
+        self._validate_access(self.no_rights_user, False, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.read_only_user, True, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.manage_only_user, False, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.manage_and_read_user, True, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.banned_from_managing_user, True, get_job, operation_id=op.id, job_id=job_id)
+
+    @authors("aleksandr.gaev")
+    @pytest.mark.parametrize("use_acl", [False, True])
+    def test_list_jobs(self, use_acl):
+        spec = self.spec if use_acl else {"aco_name": "users"}
+        op = run_test_vanilla(
+            command=with_breakpoint("BREAKPOINT"),
+            spec=spec,
+        )
+
+        (job_id,) = wait_breakpoint()
+
+        @wait_no_assert
+        def wait_jobs():
+            jobs = list_jobs(op.id)["jobs"]
+            assert len(jobs) == 1
+
+        self._validate_access(self.no_rights_user, False, list_jobs, operation_id=op.id)
+        self._validate_access(self.read_only_user, True, list_jobs, operation_id=op.id)
+        self._validate_access(self.manage_only_user, False, list_jobs, operation_id=op.id)
+        self._validate_access(self.manage_and_read_user, True, list_jobs, operation_id=op.id)
+        self._validate_access(self.banned_from_managing_user, True, list_jobs, operation_id=op.id)
+
+
+    @authors("aleksandr.gaev")
+    @pytest.mark.parametrize("use_acl", [False, True])
+    @pytest.mark.parametrize("should_archive_operation", [False, True])
+    def test_list_operations(self, use_acl, should_archive_operation):
+        spec = self.spec if use_acl else {"aco_name": "users"}
+        before_start_time = datetime.utcnow().strftime(YT_DATETIME_FORMAT_STRING)
+        op = run_test_vanilla(
+            command=with_breakpoint("BREAKPOINT"),
+            spec=spec,
+        )
+        (job_id,) = wait_breakpoint()
+        after_start_time = datetime.utcnow().strftime(YT_DATETIME_FORMAT_STRING)
+
+        cypress_operations = []
+        all_operations = []
+
+        if not use_acl:
+            # list_operations doesn't work as expected with aco_name yet.
+            cypress_operations = []
+            all_operations = []
+        else:
+            if should_archive_operation:
+                release_breakpoint()
+                clean_operations()
+                cypress_operations = []
+                all_operations = [op.id]
+            else:
+                cypress_operations = [op.id]
+                all_operations = [op.id]
+
+        def validate_operations(list_result, expected):
+            assert [op["id"] for op in list_result["operations"]] == expected
+
+        validate_operations(list_operations(authenticated_user=self.no_rights_user), [])
+        validate_operations(list_operations(authenticated_user=self.read_only_user), cypress_operations)
+        validate_operations(list_operations(authenticated_user=self.manage_only_user), [])
+        validate_operations(list_operations(authenticated_user=self.manage_and_read_user), cypress_operations)
+        validate_operations(list_operations(authenticated_user=self.banned_from_managing_user), cypress_operations)
+        validate_operations(list_operations(authenticated_user=self.banned_user), [])
+
+        @wait_no_assert
+        def wait_archive():
+            validate_operations(list_operations(include_archive=True, from_time=before_start_time, to_time=after_start_time), [op.id])
+
+        validate_operations(list_operations(authenticated_user=self.no_rights_user, include_archive=True, from_time=before_start_time, to_time=after_start_time), [])
+        validate_operations(list_operations(authenticated_user=self.read_only_user, include_archive=True, from_time=before_start_time, to_time=after_start_time), all_operations)
+        validate_operations(list_operations(authenticated_user=self.manage_only_user, include_archive=True, from_time=before_start_time, to_time=after_start_time), [])
+        validate_operations(list_operations(authenticated_user=self.manage_and_read_user, include_archive=True, from_time=before_start_time, to_time=after_start_time), all_operations)
+        validate_operations(list_operations(authenticated_user=self.banned_from_managing_user, include_archive=True, from_time=before_start_time, to_time=after_start_time), all_operations)
+        validate_operations(list_operations(authenticated_user=self.banned_user, include_archive=True, from_time=before_start_time, to_time=after_start_time), [])
+
+class TestSchedulerAclsRelaxedMode(TestSchedulerAclsBase):
+    NUM_TEST_PARTITIONS = 6
+
+    DELTA_DRIVER_CONFIG = {
+        "strict_scheduler_commands_access_validation": False,
+    }
+
+    DELTA_PROXY_CONFIG = {
+        "cluster_connection": {
+            "strict_scheduler_commands_access_validation": False,
+        },
+    }
+
+    @authors("aleksandr.gaev")
+    @pytest.mark.parametrize("use_acl", [False, True])
+    @pytest.mark.parametrize("should_archive_operation", [False, True])
+    def test_get_operation(self, use_acl, should_archive_operation):
+        spec = self.spec if use_acl else {"aco_name": "users"}
+        op = run_test_vanilla(
+            command=with_breakpoint("BREAKPOINT"),
+            spec=spec,
+        )
+        wait_breakpoint()
+
+        if should_archive_operation:
+            release_breakpoint()
+            clean_operations()
+
+        if not use_acl:
+            pytest.skip("get_operation doesn't do correct validation with aco_name yet.")
+
+        self._validate_access(self.no_rights_user, True, get_operation, op_id_or_alias=op.id)
+        self._validate_access(self.read_only_user, True, get_operation, op_id_or_alias=op.id)
+        self._validate_access(self.manage_only_user, True, get_operation, op_id_or_alias=op.id)
+        self._validate_access(self.manage_and_read_user, True, get_operation, op_id_or_alias=op.id)
+        self._validate_access(self.banned_from_managing_user, True, get_operation, op_id_or_alias=op.id)
+        self._validate_access(self.banned_user, True, get_operation, op_id_or_alias=op.id)
+
+    @authors("aleksandr.gaev")
+    @pytest.mark.parametrize("should_update_operation_parameters", [False, True])
+    @pytest.mark.parametrize("should_clean_operations", [False, True])
+    def test_get_job(self, should_update_operation_parameters, should_clean_operations):
+        op, job_id = self._run_and_fail_op(should_update_operation_parameters)
+        if should_clean_operations:
+            clean_operations()
+
+        @wait_no_assert
+        def wait():
+            job = get_job(op.id, job_id)
+            assert job
+
+        self._validate_access(self.no_rights_user, False, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.read_only_user, True, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.manage_only_user, False, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.manage_and_read_user, True, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.banned_from_managing_user, True, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.banned_user, False, get_job, operation_id=op.id, job_id=job_id)
+
+    @authors("aleksandr.gaev")
+    def test_get_job_with_aco(self):
+        op = run_test_vanilla(
+            command=with_breakpoint("BREAKPOINT"),
+            spec={
+                "aco_name": "users",
+            }
+        )
+
+        (job_id,) = wait_breakpoint()
+
+        self._validate_access(self.no_rights_user, False, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.read_only_user, True, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.manage_only_user, False, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.manage_and_read_user, True, get_job, operation_id=op.id, job_id=job_id)
+        self._validate_access(self.banned_from_managing_user, True, get_job, operation_id=op.id, job_id=job_id)
+
+    @authors("aleksandr.gaev")
+    @pytest.mark.parametrize("use_acl", [False, True])
+    def test_list_jobs(self, use_acl):
+        spec = self.spec if use_acl else {"aco_name": "users"}
+        op = run_test_vanilla(
+            command=with_breakpoint("BREAKPOINT"),
+            spec=spec,
+        )
+
+        (job_id,) = wait_breakpoint()
+
+        @wait_no_assert
+        def wait_jobs():
+            jobs = list_jobs(op.id)["jobs"]
+            assert len(jobs) == 1
+
+        self._validate_access(self.no_rights_user, False, list_jobs, operation_id=op.id)
+        self._validate_access(self.read_only_user, True, list_jobs, operation_id=op.id)
+        self._validate_access(self.manage_only_user, False, list_jobs, operation_id=op.id)
+        self._validate_access(self.manage_and_read_user, True, list_jobs, operation_id=op.id)
+        self._validate_access(self.banned_from_managing_user, True, list_jobs, operation_id=op.id)
+
+
+    @authors("aleksandr.gaev")
+    @pytest.mark.parametrize("use_acl", [False, True])
+    @pytest.mark.parametrize("should_archive_operation", [False, True])
+    def test_list_operations(self, use_acl, should_archive_operation):
+        spec = self.spec if use_acl else {"aco_name": "users"}
+        before_start_time = datetime.utcnow().strftime(YT_DATETIME_FORMAT_STRING)
+        op = run_test_vanilla(
+            command=with_breakpoint("BREAKPOINT"),
+            spec=spec,
+        )
+        (job_id,) = wait_breakpoint()
+        after_start_time = datetime.utcnow().strftime(YT_DATETIME_FORMAT_STRING)
+
+        cypress_operations = []
+        all_operations = []
+
+        if should_archive_operation:
+            release_breakpoint()
+            clean_operations()
+            cypress_operations = []
+            all_operations = [op.id]
+        else:
+            cypress_operations = [op.id]
+            all_operations = [op.id]
+
+        def validate_operations(list_result, expected):
+            assert [op["id"] for op in list_result["operations"]] == expected
+
+        print_debug(f"USE_ACL: {use_acl}, SHOULD_ARCHIVE: {should_archive_operation}")
+        print_debug(f"cypress_operations: {cypress_operations}, all_operations: {all_operations}")
+
+        validate_operations(list_operations(authenticated_user=self.no_rights_user), cypress_operations)
+        validate_operations(list_operations(authenticated_user=self.read_only_user), cypress_operations)
+        validate_operations(list_operations(authenticated_user=self.manage_only_user), cypress_operations)
+        validate_operations(list_operations(authenticated_user=self.manage_and_read_user), cypress_operations)
+        validate_operations(list_operations(authenticated_user=self.banned_from_managing_user), cypress_operations)
+        validate_operations(list_operations(authenticated_user=self.banned_user), cypress_operations)
+
+        @wait_no_assert
+        def wait_archive():
+            validate_operations(list_operations(include_archive=True, from_time=before_start_time, to_time=after_start_time), [op.id])
+
+        validate_operations(list_operations(authenticated_user=self.no_rights_user, include_archive=True, from_time=before_start_time, to_time=after_start_time), all_operations)
+        validate_operations(list_operations(authenticated_user=self.read_only_user, include_archive=True, from_time=before_start_time, to_time=after_start_time), all_operations)
+        validate_operations(list_operations(authenticated_user=self.manage_only_user, include_archive=True, from_time=before_start_time, to_time=after_start_time), all_operations)
+        validate_operations(list_operations(authenticated_user=self.manage_and_read_user, include_archive=True, from_time=before_start_time, to_time=after_start_time), all_operations)
+        validate_operations(list_operations(authenticated_user=self.banned_from_managing_user, include_archive=True, from_time=before_start_time, to_time=after_start_time), all_operations)
+        validate_operations(list_operations(authenticated_user=self.banned_user, include_archive=True, from_time=before_start_time, to_time=after_start_time), all_operations)

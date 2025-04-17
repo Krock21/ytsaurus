@@ -2378,6 +2378,8 @@ TListJobsResult TClient::DoListJobs(
             operationId = ResolveOperationAlias(alias, optionsResult, deadline);
         });
 
+    ValidateOperationAccess(operationId, NullJobId, EPermissionSet(EPermission::Read));
+
     // Get jobs from archive.
     // Issue the requests in parallel.
     TFuture<std::vector<TJob>> archiveResultFuture;
@@ -2395,7 +2397,7 @@ TListJobsResult TClient::DoListJobs(
     // Get jobs from controller agent.
     auto controllerAgentAddress = FindControllerAgentAddressFromCypress(
         operationId,
-        MakeStrong(this));
+        GetOperationsArchiveClient());
     auto controllerAgentResultFuture = DoListJobsFromControllerAgentAsync(
         operationId,
         controllerAgentAddress,
@@ -2591,7 +2593,7 @@ std::optional<TJob> TClient::DoGetJobFromControllerAgent(
 {
     auto controllerAgentAddress = FindControllerAgentAddressFromCypress(
         operationId,
-        MakeStrong(this));
+        GetOperationsArchiveClient());
     if (!controllerAgentAddress) {
         return {};
     }
@@ -2682,6 +2684,8 @@ TYsonString TClient::DoGetJob(
         [&] (const TString& alias) {
             operationId = ResolveOperationAlias(alias, options, deadline);
         });
+
+    ValidateOperationAccess(operationId, jobId, EPermissionSet(EPermission::Read));
 
     auto operationInfoFuture = GetOperation(operationId, TGetOperationOptions{
         .Attributes = {{"state"}},

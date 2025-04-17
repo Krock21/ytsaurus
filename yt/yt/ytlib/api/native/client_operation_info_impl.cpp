@@ -379,7 +379,6 @@ static THashSet<TString> MakeIgnoredArchiveAttributes(THashSet<TString> ignoredA
     return ignoredAttributes;
 }
 
-
 std::optional<TOperation> TClient::DoGetOperationFromArchive(
     NScheduler::TOperationId operationId,
     TInstant deadline,
@@ -502,6 +501,9 @@ static TYsonString GetLatestProgress(const TYsonString& cypressProgress, const T
 static bool IsErrorRetriable(const TError& error)
 {
     if (error.FindMatching(NTabletClient::EErrorCode::ColumnNotFound)) {
+        return false;
+    }
+    if (error.FindMatching(NSecurityClient::EErrorCode::AuthorizationError)) {
         return false;
     }
     return true;
@@ -709,6 +711,22 @@ TOperation TClient::DoGetOperationImpl(
     return *archiveResult;
 }
 
+static std::optional<TAccessControlRule> GetOperationAccessControlRule(const TOperation& operation)
+{
+    if (operation.RuntimeParameters) {
+        auto runtimeParametersNode = ConvertToNode(operation.RuntimeParameters);
+        if (runtimeParametersNode->GetType() == ENodeType::Map) {
+            if (auto acl = runtimeParametersNode->AsMap()->FindChild("acl")) {
+                return ConvertTo<TSerializableAccessControlList>(acl);
+            }
+            if (auto acoName = runtimeParametersNode->AsMap()->FindChild("aco_name")) {
+                return ConvertTo<TString>(acoName);
+            }
+        }
+    }
+    return {};
+}
+
 TOperation TClient::DoGetOperation(
     const TOperationIdOrAlias& operationIdOrAlias,
     const TGetOperationOptions& options)
@@ -731,9 +749,14 @@ TOperation TClient::DoGetOperation(
         });
 
     const auto retryInterval = Connection_->GetConfig()->DefaultGetOperationRetryInterval;
+    auto getOperationOptions = options;
+    if (Connection_->GetConfig()->StrictSchedulerCommandsAccessValidation && getOperationOptions.Attributes) {
+        // Request runtime_parameters to perform access control validation.
+        getOperationOptions.Attributes->insert("runtime_parameters");
+    }
     while (true) {
         try {
-            auto operation = DoGetOperationImpl(operationId, deadline, options);
+            auto operation = DoGetOperationImpl(operationId, deadline, getOperationOptions);
 
             // COMPAT(gepardo): this must be preserved until the operations without provided_spec (i.e. started before mid-2022)
             // are no longer in the operations archive.
@@ -741,6 +764,28 @@ TOperation TClient::DoGetOperation(
                 !operation.ProvidedSpec)
             {
                 operation.ProvidedSpec = operation.Spec;
+            }
+
+            if (Connection_->GetConfig()->StrictSchedulerCommandsAccessValidation) {
+                auto accessControlRule = GetOperationAccessControlRule(operation);
+                if (accessControlRule) {
+                    NScheduler::ValidateOperationAccess(
+                        Options_.GetAuthenticatedUser(),
+                        operationId,
+                        EPermissionSet::Read,
+                        *accessControlRule,
+                        this,
+                        Logger());
+                } else {
+                    THROW_ERROR_EXCEPTION(
+                        "Failed to validate operation access, operation has no access control rule")
+                        << TErrorAttribute("operation_id", operationId);
+                }
+            }
+
+            if (Connection_->GetConfig()->StrictSchedulerCommandsAccessValidation && options.Attributes && !options.Attributes->contains("runtime_parameters")) {
+                // Remove runtime_parameters field if it was not requested.
+                operation.RuntimeParameters = {};
             }
 
             return operation;
@@ -1056,6 +1101,12 @@ THashMap<TOperationId, TOperation> TClient::DoListOperationsFromArchive(
                 Format("is_substr(%Qv, filter_factors)", *options.SubstrFilter));
         }
 
+        if (Connection_->GetConfig()->StrictSchedulerCommandsAccessValidation && !options.UserTransitiveClosure.contains(SuperusersGroupName)) {
+            builder->AddWhereConjunct(Format("NOT is_null(acl) AND _yt_has_permissions(acl, %Qv, %Qv)",
+                ConvertToYsonString(options.UserTransitiveClosure, EYsonFormat::Text),
+                ConvertToYsonString(EPermissionSet::Read, EYsonFormat::Text)));
+        }
+
         if (options.AccessFilter) {
             builder->AddWhereConjunct(Format("NOT is_null(acl) AND _yt_has_permissions(acl, %Qv, %Qv)",
                 ConvertToYsonString(options.AccessFilter->SubjectTransitiveClosure, EYsonFormat::Text),
@@ -1279,12 +1330,22 @@ TListOperationsResult TClient::DoListOperations(const TListOperationsOptions& ol
         options.SubstrFilter = to_lower(*options.SubstrFilter);
     }
 
+    auto proxy = NObjectClient::CreateObjectServiceReadProxy(
+        this,
+        options.ReadFrom,
+        PrimaryMasterCellTagSentinel,
+        Connection_->GetStickyGroupSizeCache());
+
+    if (Connection_->GetConfig()->StrictSchedulerCommandsAccessValidation) {
+        options.StrictSchedulerCommandsAccessValidation = true;
+        options.UserTransitiveClosure = GetSubjectClosure(
+            Options_.GetAuthenticatedUser(),
+            proxy,
+            Connection_,
+            options);
+    }
+
     if (options.AccessFilter) {
-        auto proxy = NObjectClient::CreateObjectServiceReadProxy(
-            GetOperationsArchiveClient(),
-            options.ReadFrom,
-            PrimaryMasterCellTagSentinel,
-            Connection_->GetStickyGroupSizeCache());
         options.AccessFilter->SubjectTransitiveClosure = GetSubjectClosure(
             options.AccessFilter->Subject,
             proxy,
